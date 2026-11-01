@@ -81,37 +81,3 @@ TURN server. Add one (for example a small `coturn` instance) through the
 The server has no database. Rooms live in memory and disappear on restart; a
 client simply scans again. Do not log SDP, ICE candidates or tokens.
 
-## Run
-
-```sh
-go run ./sync
-```
-
-or build the container from the repository root:
-
-```sh
-docker build -f sync/Dockerfile -t err-signal .
-docker run --rm -p 8080:8080 -e ALLOWED_ORIGINS='https://app.example' err-signal
-```
-
-The QR flow is:
-
-1. Web creates a room and shows a QR with `room`, `token`, the signaling URL and
-   the vault key.
-2. Phone scans it, joins the WebSocket room and exchanges offer/answer/ICE.
-3. The peers connect directly and run the bidirectional merge over the WebRTC
-   data channel.
-4. The progress dialog reports connecting, handshake, sending, receiving,
-   merging and done.
-
-The WebRTC and merge side lives in the Flutter client (to be implemented); this
-service only provides the signaling rendezvous.
-
-## Test
-
-```sh
-go test ./sync
-```
-
-The tests cover room creation, ICE configuration, the waiting/ready handshake,
-offer/answer/ICE relay, token rejection, the two-peer limit and CORS preflight.
