@@ -13,8 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +32,8 @@ const (
 	writeTimeout    = 10 * time.Second
 	pingInterval    = 30 * time.Second
 	cleanupInterval = 30 * time.Second
+	// limiterIdleTTL is how long an idle per-client rate limit bucket is kept.
+	limiterIdleTTL = 10 * time.Minute
 )
 
 // iceServer is the WebRTC configuration returned with a new room. The default
@@ -43,6 +48,8 @@ type config struct {
 	addr            string
 	roomTTL         time.Duration
 	maxRooms        int
+	rateLimit       int
+	trustProxy      bool
 	allowedOrigins  []string
 	allowAllOrigins bool
 	iceServers      []iceServer
@@ -50,7 +57,8 @@ type config struct {
 }
 
 type server struct {
-	cfg config
+	cfg     config
+	limiter *rateLimiter
 
 	mu    sync.Mutex
 	rooms map[string]*room
@@ -89,7 +97,11 @@ func newServer(cfg config) *server {
 	if cfg.log == nil {
 		cfg.log = slog.Default()
 	}
-	return &server{cfg: cfg, rooms: map[string]*room{}}
+	return &server{
+		cfg:     cfg,
+		limiter: newRateLimiter(cfg.rateLimit),
+		rooms:   map[string]*room{},
+	}
 }
 
 func (s *server) routes() http.Handler {
@@ -101,10 +113,7 @@ func (s *server) routes() http.Handler {
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	s.mu.Lock()
-	rooms := len(s.rooms)
-	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rooms": rooms})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
@@ -115,14 +124,36 @@ func (s *server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.limiter.allow(clientIP(r, s.cfg.trustProxy)) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	// The response carries a bearer token, so it must never be cached.
+	w.Header().Set("Cache-Control", "no-store")
+
 	s.mu.Lock()
 	if len(s.rooms) >= s.cfg.maxRooms {
 		s.mu.Unlock()
+		w.Header().Set("Retry-After", "30")
 		http.Error(w, "too many rooms", http.StatusServiceUnavailable)
 		return
 	}
-	id := randomToken(12)
-	token := randomToken(32)
+	id, err := uniqueRoomID(s.rooms)
+	if err != nil {
+		s.mu.Unlock()
+		s.cfg.log.Error("generate room id", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	token, err := randomToken(32)
+	if err != nil {
+		s.mu.Unlock()
+		s.cfg.log.Error("generate room token", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	now := time.Now()
 	room := &room{
 		id:           id,
@@ -144,7 +175,7 @@ func (s *server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("room")
-	token := r.URL.Query().Get("token")
+	token := tokenFromRequest(r)
 	room := s.room(roomID)
 	if room == nil || !room.validToken(token) {
 		http.Error(w, "room not found or token invalid", http.StatusUnauthorized)
@@ -157,14 +188,22 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 		CompressionMode:    websocket.CompressionDisabled,
 	})
 	if err != nil {
+		s.cfg.log.Debug("websocket accept failed", "room", roomID, "err", err)
 		return
 	}
 	conn.SetReadLimit(maxMessageBytes)
 
 	p := newPeer(conn)
 	count := room.join(p)
-	if count == 0 {
-		_ = conn.Close(websocket.StatusPolicyViolation, "room is full")
+	if count == 0 || !s.isRegistered(roomID, room) {
+		// The room filled up, or the cleanup loop expired it between lookup and
+		// join. Either way this connection must not linger in a detached room.
+		reason := "room is gone"
+		if count == 0 {
+			reason = "room is full"
+		}
+		room.leave(p)
+		_ = conn.Close(websocket.StatusPolicyViolation, reason)
 		return
 	}
 	go p.writeLoop()
@@ -196,29 +235,41 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) room(id string) *room {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	room := s.rooms[id]
 	if room == nil {
+		s.mu.Unlock()
 		return nil
 	}
-	if time.Since(room.touch()) > s.cfg.roomTTL {
+	if time.Since(room.lastActive()) > s.cfg.roomTTL {
 		delete(s.rooms, id)
+		s.mu.Unlock()
+		room.closeAll("room expired")
 		return nil
 	}
+	s.mu.Unlock()
 	return room
+}
+
+// isRegistered reports whether room is still the live room stored under id.
+func (s *server) isRegistered(id string, room *room) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rooms[id] == room
 }
 
 func (s *server) cors(w http.ResponseWriter, r *http.Request) bool {
 	origin := r.Header.Get("Origin")
+	if origin != "" {
+		w.Header().Add("Vary", "Origin")
+	}
 	switch {
 	case s.cfg.allowAllOrigins:
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	case origin != "" && s.originAllowed(origin):
 		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Add("Vary", "Origin")
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return true
@@ -260,7 +311,7 @@ func (s *server) cleanupLoop(ctx context.Context) {
 			s.mu.Lock()
 			var expired []*room
 			for id, room := range s.rooms {
-				if now.Sub(room.touch()) > s.cfg.roomTTL {
+				if now.Sub(room.lastActive()) > s.cfg.roomTTL {
 					delete(s.rooms, id)
 					expired = append(expired, room)
 				}
@@ -269,6 +320,7 @@ func (s *server) cleanupLoop(ctx context.Context) {
 			for _, room := range expired {
 				room.closeAll("room expired")
 			}
+			s.limiter.sweep(limiterIdleTTL)
 		}
 	}
 }
@@ -278,12 +330,12 @@ func (r *room) validToken(token string) bool {
 	return subtle.ConstantTimeCompare(sum[:], r.tokenHash[:]) == 1
 }
 
-func (r *room) touch() time.Time {
+// lastActive reports the last time the room saw any activity. It never
+// mutates the timestamp: expiry checks must not keep a room alive.
+func (r *room) lastActive() time.Time {
 	r.mu.Lock()
-	r.lastActivity = time.Now()
-	last := r.lastActivity
-	r.mu.Unlock()
-	return last
+	defer r.mu.Unlock()
+	return r.lastActivity
 }
 
 func (r *room) join(p *peer) int {
@@ -416,26 +468,134 @@ func (p *peer) close(code websocket.StatusCode, reason string) {
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func randomToken(bytes int) string {
-	buf := make([]byte, bytes)
+func randomToken(n int) (string, error) {
+	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
-		panic(fmt.Sprintf("crypto/rand: %v", err))
+		return "", fmt.Errorf("crypto/rand: %w", err)
 	}
-	return base64.RawURLEncoding.EncodeToString(buf)
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// uniqueRoomID picks an unused room id. The caller must hold s.mu.
+func uniqueRoomID(rooms map[string]*room) (string, error) {
+	for {
+		id, err := randomToken(12)
+		if err != nil {
+			return "", err
+		}
+		if _, exists := rooms[id]; !exists {
+			return id, nil
+		}
+	}
+}
+
+// tokenFromRequest reads the room token from the query string (browsers cannot
+// set headers on a WebSocket handshake) or from an Authorization: Bearer
+// header (native clients and tooling).
+func tokenFromRequest(r *http.Request) string {
+	if token := r.URL.Query().Get("token"); token != "" {
+		return token
+	}
+	const prefix = "Bearer "
+	if header := r.Header.Get("Authorization"); len(header) > len(prefix) && strings.EqualFold(header[:len(prefix)], prefix) {
+		return strings.TrimSpace(header[len(prefix):])
+	}
+	return ""
+}
+
+// clientIP returns the rate limiting key for a request. X-Forwarded-For is only
+// honoured when the deployment sits behind a trusted proxy, because clients can
+// spoof the header otherwise.
+func clientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
+				return first
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// rateLimiter is a per-key token bucket. A nil limiter allows everything, which
+// is what RATE_LIMIT=0 asks for.
+type rateLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	perSec  float64
+	burst   float64
+	now     func() time.Time
+}
+
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
+
+func newRateLimiter(perMinute int) *rateLimiter {
+	if perMinute <= 0 {
+		return nil
+	}
+	return &rateLimiter{
+		buckets: map[string]*bucket{},
+		perSec:  float64(perMinute) / 60,
+		burst:   float64(perMinute),
+		now:     time.Now,
+	}
+}
+
+func (l *rateLimiter) allow(key string) bool {
+	if l == nil {
+		return true
+	}
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.buckets[key]
+	if b == nil {
+		b = &bucket{tokens: l.burst, last: now}
+		l.buckets[key] = b
+	}
+	b.tokens = math.Min(l.burst, b.tokens+now.Sub(b.last).Seconds()*l.perSec)
+	b.last = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+func (l *rateLimiter) sweep(maxIdle time.Duration) {
+	if l == nil {
+		return
+	}
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for key, b := range l.buckets {
+		if now.Sub(b.last) > maxIdle {
+			delete(l.buckets, key)
+		}
+	}
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		addr:            envAddr(),
-		roomTTL:         10 * time.Minute,
-		maxRooms:        1000,
-		allowedOrigins:  splitList(os.Getenv("ALLOWED_ORIGINS")),
-		allowAllOrigins: true,
-		log:             slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		addr:           envAddr(),
+		roomTTL:        10 * time.Minute,
+		maxRooms:       1000,
+		rateLimit:      60,
+		allowedOrigins: splitList(os.Getenv("ALLOWED_ORIGINS")),
+		log:            slog.New(slog.NewTextHandler(os.Stdout, nil)),
 	}
 	if raw := os.Getenv("ROOM_TTL"); raw != "" {
 		ttl, err := time.ParseDuration(raw)
@@ -451,17 +611,31 @@ func loadConfig() (config, error) {
 		}
 		cfg.maxRooms = n
 	}
-	if len(cfg.allowedOrigins) > 0 {
-		for _, origin := range cfg.allowedOrigins {
-			if origin == "*" {
-				cfg.allowAllOrigins = true
-				cfg.allowedOrigins = nil
-				break
-			}
-			cfg.allowAllOrigins = false
+	if raw := os.Getenv("RATE_LIMIT"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return config{}, fmt.Errorf("RATE_LIMIT must be a non-negative integer")
 		}
-	} else {
+		cfg.rateLimit = n
+	}
+	if raw := os.Getenv("TRUST_PROXY"); raw != "" {
+		trust, err := strconv.ParseBool(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("TRUST_PROXY: %w", err)
+		}
+		cfg.trustProxy = trust
+	}
+	// Origin checks are deny-by-default: without ALLOWED_ORIGINS only requests
+	// from the signaling server's own host are accepted. "*" opts into the old
+	// allow-everything behaviour and is meant for local development only.
+	if slices.Contains(cfg.allowedOrigins, "*") {
+		cfg.allowedOrigins = nil
 		cfg.allowAllOrigins = true
+	}
+	if cfg.allowAllOrigins {
+		cfg.log.Warn("ALLOWED_ORIGINS=*: every origin may create rooms and join; do not use this in production")
+	} else if len(cfg.allowedOrigins) == 0 {
+		cfg.log.Warn("ALLOWED_ORIGINS is unset: only same-origin requests are accepted; set it to the client origins, or to * for development")
 	}
 	cfg.iceServers = iceServersFromEnv()
 	if len(cfg.iceServers) == 0 {
